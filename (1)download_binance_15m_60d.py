@@ -1,116 +1,109 @@
-import requests
-import pandas as pd
-from datetime import datetime, timezone
-import time
+"""Utilidad manual de descarga, separada del experimento offline.
+
+Importar este módulo no descarga ni crea carpetas. Ejecutarlo requiere
+--allow-download; ningún comando de trading.cli invoca esta utilidad.
+El rango es [start, end), en UTC. No necesita pandas.
+"""
+
+import argparse
+import csv
+import json
 from pathlib import Path
+import time
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
-# Configuración
-BASE_URL  = "https://fapi.binance.com/fapi/v1/klines"
-SYMBOL    = "BTCUSDT"
-INTERVAL  = "15m"
-LIMIT     = 1500
+import numpy as np
 
-# Fechas del paper (septiembre 2019 – enero 2022)
-START_DATE = datetime(2019, 9, 10,  tzinfo=timezone.utc)
-END_DATE   = datetime(2022, 1, 31, tzinfo=timezone.utc)
+from trading.data import MarketData, iso_utc, timestamp_ms
 
-# Rutas
-project_root   = Path(__file__).resolve().parent.parent
-raw_path       = project_root / "data_raw"
-processed_path = project_root / "data_processed"
-raw_path.mkdir(exist_ok=True)
-processed_path.mkdir(exist_ok=True)
-
-FILE_SUFFIX = f"{START_DATE.strftime('%Y%m%d')}_{END_DATE.strftime('%Y%m%d')}"
-
-# Descarga paginada
-def to_millis(dt: datetime) -> int:
-    return int(dt.timestamp() * 1000)
-
-def download_klines(symbol, interval, start_dt, end_dt):
-    start_ms = to_millis(start_dt)
-    end_ms   = to_millis(end_dt)
-    all_rows = []
-
-    while start_ms < end_ms:
-        params = {
-            "symbol":    symbol,
-            "interval":  interval,
-            "startTime": start_ms,
-            "endTime":   end_ms,
-            "limit":     LIMIT,
-        }
-        resp = requests.get(BASE_URL, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if not data:
-            break
-
-        all_rows.extend(data)
-        start_ms = data[-1][0] + 1
-        print(f"  Filas acumuladas: {len(all_rows)}")
-        time.sleep(0.2)
-
-    return all_rows
-
-# Construcción del DataFrame
+BASE_URL = "https://fapi.binance.com/fapi/v1/klines"
+SYMBOL = "BTCUSDT"
+INTERVAL = "15m"
+LIMIT = 1500
+PROJECT_ROOT = Path(__file__).resolve().parent
 COLUMNS = [
-    "open_time", "open", "high", "low", "close", "volume",
-    "close_time", "quote_asset_volume", "number_of_trades",
-    "taker_buy_base_volume", "taker_buy_quote_volume", "ignore"
+    "open_time", "open", "high", "low", "close", "volume", "close_time",
+    "quote_asset_volume", "number_of_trades", "taker_buy_base_volume",
+    "taker_buy_quote_volume", "ignore",
 ]
 
-NUMERIC = ["open", "high", "low", "close", "volume",
-           "quote_asset_volume", "taker_buy_base_volume", "taker_buy_quote_volume"]
 
-def build_dataframe(rows):
-    df = pd.DataFrame(rows, columns=COLUMNS)
-    df = df.drop(columns=["ignore"])
+def download_klines(symbol, interval, start_ms, end_ms):
+    """Explicit caller-only network operation; end is exclusive."""
+    if start_ms >= end_ms:
+        raise ValueError("start debe ser anterior a end")
+    cursor, rows = start_ms, []
+    while cursor < end_ms:
+        query = urlencode({"symbol": symbol, "interval": interval, "startTime": cursor,
+                           "endTime": end_ms - 1, "limit": LIMIT})
+        with urlopen(Request(BASE_URL + "?" + query), timeout=30) as response:
+            batch = json.load(response)
+        if not isinstance(batch, list):
+            raise ValueError("Binance no devolvió una lista de velas")
+        if not batch:
+            break
+        if any(not isinstance(row, list) or len(row) != len(COLUMNS) for row in batch):
+            raise ValueError("Respuesta de velas con formato inválido")
+        if any(not cursor <= int(row[0]) < end_ms for row in batch):
+            raise ValueError("Respuesta fuera del rango solicitado")
+        next_cursor = int(batch[-1][0]) + 1
+        if next_cursor <= cursor:
+            raise ValueError("La paginación no avanzó")
+        rows.extend(batch)
+        cursor = next_cursor
+        print(f"Filas recibidas: {len(rows)}")
+        time.sleep(0.2)
+    return rows
 
-    for col in NUMERIC:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["number_of_trades"] = pd.to_numeric(df["number_of_trades"], errors="coerce")
 
-    df["open_time"]  = pd.to_datetime(df["open_time"],  unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+def build_market_data(rows):
+    """Normalize original rows without silently sorting or deduplicating."""
+    data = MarketData(np.asarray([int(row[0]) for row in rows], dtype=np.int64),
+                      *(np.asarray([float(row[column]) for row in rows])
+                        for column in (1, 2, 3, 4, 5)))
+    data.validate()
+    return data
 
-    df = (df.drop_duplicates(subset=["open_time"])
-            .sort_values("open_time")
-            .reset_index(drop=True))
-    return df
 
-# Validación de huecos
-def check_gaps(df, interval_minutes=15):
-    expected = pd.Timedelta(minutes=interval_minutes)
-    diffs    = df["open_time"].diff().dropna()
-    gaps     = diffs[diffs != expected]
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--allow-download", action="store_true",
+                        help="Habilita explícitamente acceso de red; no usar en este entorno")
+    parser.add_argument("--start", default="2019-09-10")
+    parser.add_argument("--end", default="2022-01-31", help="UTC, exclusivo")
+    parser.add_argument("--output-root", type=Path, default=PROJECT_ROOT)
+    args = parser.parse_args(argv)
+    if not args.allow_download:
+        parser.error("Descarga deshabilitada. Usa un CSV local con python -m trading.cli.")
+    start, end = timestamp_ms(args.start), timestamp_ms(args.end)
+    if start % 900000 or end % 900000 or start >= end:
+        parser.error("Fechas inválidas: deben alinearse a 15 minutos y start < end")
+    rows = download_klines(SYMBOL, INTERVAL, start, end)
+    if not rows:
+        parser.error("No se recibieron datos; no se escribieron CSV")
+    suffix = iso_utc(start)[:10].replace("-", "") + "_" + iso_utc(end)[:10].replace("-", "")
+    raw_path = args.output_root / "data_raw" / f"BTCUSDT_15m_{suffix}_raw.csv"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    with raw_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(COLUMNS)
+        writer.writerows(rows)
+    # Keep raw evidence even when strict validation rejects the processed series.
+    data = build_market_data(rows)
+    if int(data.times[0]) != start or int(data.times[-1]) + data.interval_ms != end:
+        raise ValueError("La descarga no cubre el rango completo; solo se conservó el raw")
+    processed_path = args.output_root / "data_processed" / f"BTCUSDT_15m_{suffix}_processed.csv"
+    processed_path.parent.mkdir(parents=True, exist_ok=True)
+    with processed_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["open_time", "open", "high", "low", "close", "volume"])
+        for i in range(len(data)):
+            writer.writerow([iso_utc(int(data.times[i])), data.open[i], data.high[i],
+                             data.low[i], data.close[i], data.volume[i]])
+    print(f"Raw: {raw_path}\nProcessed: {processed_path}")
+    return 0
 
-    if gaps.empty:
-        print("  Sin huecos temporales detectados.")
-    else:
-        print(f"  ⚠️  {len(gaps)} huecos detectados:")
-        for idx, val in gaps.items():
-            print(f"     Índice {idx}: salto de {val} en {df.loc[idx, 'open_time']}")
 
-# Main
 if __name__ == "__main__":
-    rows = download_klines(SYMBOL, INTERVAL, START_DATE, END_DATE)
-    df   = build_dataframe(rows)
-
-    check_gaps(df)
-
-    raw_file       = raw_path       / f"BTCUSDT_15m_{FILE_SUFFIX}_raw.csv"
-    processed_file = processed_path / f"BTCUSDT_15m_{FILE_SUFFIX}_processed.csv"
-
-    df.to_csv(raw_file, index=False)
-    df[["open_time", "open", "high", "low", "close", "volume"]].to_csv(
-        processed_file, index=False
-    )
-
-    print(f"\nArchivo raw:       {raw_file}")
-    print(f"Archivo processed: {processed_file}")
-    print(f"Total filas:       {len(df)}")
-    print(f"Primer timestamp:  {df['open_time'].min()}")
-    print(f"Último timestamp:  {df['open_time'].max()}")
-    print(df.head())
+    raise SystemExit(main())

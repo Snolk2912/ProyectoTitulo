@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "offline-2sma-lb2"
+version = "0.1.0"
+description = "Reproducible offline 2-SMA trading simulation and LB2 optimization"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24,<3"]
+
+[project.optional-dependencies]
+plots = ["matplotlib>=3.7"]
+test = ["pytest>=7"]
+
+[project.scripts]
+trading-lb2 = "trading.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["trading*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
